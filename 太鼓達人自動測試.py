@@ -1243,9 +1243,10 @@ def play_events(
                     balloon_hits[balloon_idx] = balloon_hits.get(balloon_idx, 0) + 1
 
         if balloon_hits:
-            print("氣球擊打統計 (balloon_index -> hits):")
-            for bi, cnt in sorted(balloon_hits.items()):
-                print(f"  balloon #{bi} -> {cnt} hits")
+            pass
+            # print("氣球擊打統計 (balloon_index -> hits):")
+            # for bi, cnt in sorted(balloon_hits.items()):
+            #     print(f"  balloon #{bi} -> {cnt} hits")
 
     except KeyboardInterrupt:
         print("使用者中斷 (KeyboardInterrupt)，播放停止。")
