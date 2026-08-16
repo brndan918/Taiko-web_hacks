@@ -271,6 +271,9 @@ if IS_WINDOWS:
     def is_middle_button_down() -> bool:
         return bool(user32.GetAsyncKeyState(VK_MBUTTON) & 0x8000)
 
+    def is_c_key_down() -> bool:
+        return bool(user32.GetAsyncKeyState(VK_C) & 0x8000)
+
 else:
     try:
         import keyboard as _keyboard_non_windows
@@ -303,6 +306,9 @@ else:
         _keyboard_non_windows.send("enter")
 
     def is_middle_button_down() -> bool:
+        return False
+
+    def is_c_key_down() -> bool:
         return False
 
 
@@ -400,6 +406,40 @@ def show_song_selected_feedback(song: Dict[str, Any]):
             root.destroy()
         except Exception:
             pass
+
+
+def open_tja_file_dialog() -> Optional[Tuple[str, bytes]]:
+    """開啟原生檔案總管，選擇本機 TJA 檔案，讀取為記憶體 bytes（不寫入暫存檔）。"""
+    try:
+        import os
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
+
+        file_path = filedialog.askopenfilename(
+            parent=root,
+            title="選擇本機 TJA 檔案",
+            filetypes=[("TJA 譜面檔", "*.tja"), ("所有檔案", "*.*")],
+        )
+        root.destroy()
+
+        if not file_path:
+            print("❌ 未選擇任何檔案。")
+            return None
+
+        with open(file_path, "rb") as f:
+            data = f.read()
+
+        filename = os.path.basename(file_path)
+        print(f"✅ 本機 TJA 載入完成：{filename}（{len(data):,} bytes）")
+        return filename, data
+    except Exception as exc:
+        print(f"⚠️ 開啟檔案總管失敗：{exc}")
+        return None
 
 
 def _course_display_name(course: str) -> str:
@@ -545,23 +585,49 @@ def download_tja_to_memory(url: str) -> Optional[bytes]:
 
 
 def wait_for_song_selection(songs: List[Dict[str, Any]], shutdown_event: threading.Event) -> Optional[Dict[str, Any]]:
-    """等待中鍵；中鍵事件只在目前不演奏時處理。"""
+    """等待中鍵或 C 鍵；事件只在目前不演奏時處理。
+    - 中鍵：模擬 Ctrl+C 讀取遊戲內目前選取的歌曲，並比對線上歌曲清單。
+    - C 鍵：開啟檔案總管，選擇本機 TJA 檔案直接使用（不經過線上比對/下載）。
+    回傳的 song dict 若含有 "_local_tja_bytes"，代表是本機檔案，呼叫端應直接使用該
+    bytes 作為 TJA 內容，不需再呼叫 download_tja_to_memory()。
+    """
     if not IS_WINDOWS:
         print("⚠️ 目前的中鍵選歌流程使用 Windows GetAsyncKeyState；非 Windows 無法啟用。")
         return None
 
-    print("🖱️ 等待中鍵選歌...")
+    print("🖱️ 等待中鍵選歌，或按 C 鍵載入本機 TJA 檔案...")
     previous_middle = False
+    previous_c = False
 
     while not shutdown_event.is_set():
         pressed = is_middle_button_down()
-        if pressed and not previous_middle:
+        c_pressed = is_c_key_down()
+
+        if c_pressed and not previous_c:
+            print("⌨️ 偵測到 C 鍵 → 開啟檔案總管，選擇本機 TJA 檔案...")
+            local_result = open_tja_file_dialog()
+
+            if local_result is not None:
+                filename, data = local_result
+                song = {
+                    "id": None,
+                    "title": filename,
+                    "title_en": filename,
+                    "url": None,
+                    "courses": {},
+                    "_local_tja_bytes": data,
+                }
+                show_song_selected_feedback(song)
+                return song
+
+        elif pressed and not previous_middle:
             print("🖱️ 偵測到中鍵 → 模擬 Ctrl+C，讀取目前選取歌曲...")
             try:
                 press_ctrl_c()
             except Exception as exc:
                 print(f"⚠️ 模擬 Ctrl+C 失敗：{exc}")
                 previous_middle = pressed
+                previous_c = c_pressed
                 time.sleep(0.08)
                 continue
 
@@ -589,6 +655,7 @@ def wait_for_song_selection(songs: List[Dict[str, Any]], shutdown_event: threadi
                 return song
 
         previous_middle = pressed
+        previous_c = c_pressed
         time.sleep(0.02)
 
     return None
@@ -1046,12 +1113,31 @@ def wait_until_ns(target_ns, stop_event=None, shutdown_event=None):
             continue
 
 
-def start_stop_listener(start_event: threading.Event, stop_event: threading.Event, shutdown_event: threading.Event):
+def s_key_listener(
+    session_ref: Dict[str, Any],
+    session_lock: threading.Lock,
+    shutdown_event: threading.Event,
+):
+    """全程只註冊「一次」's' 熱鍵監聽，透過共用的 session_ref 判斷目前是要
+    開始還是停止。
+
+    修正原因：舊版每首歌都會建立一個新的 start_stop_listener 執行緒去呼叫
+    keyboard.wait("s")。如果一首歌播放到「自然結束」（沒有人按第二次 's'
+    手動停止），那個執行緒不會結束，會繼續卡在 keyboard.wait("s") 等待「第二
+    次」按鍵；接著下一首歌又會再建立一個全新的監聽執行緒，於是同時有兩個執行緒
+    在等待 's'。使用者按下 's' 時，這次按鍵有時會被「上一首歌」殘留的舊執行緒
+    當成第二次按鍵吃掉（印出「停止播放」但操作的是舊的、已經沒人在用的
+    start_event/stop_event），導致新的一首歌的監聽執行緒完全沒收到這次按鍵，
+    使得 main() 卡在等待 start_event/stop_event 的迴圈裡出不來。
+
+    改成全程只有一個執行緒呼叫 keyboard.wait("s")，每首歌只是更新
+    session_ref 內的 start_event/stop_event/started，就不會有多個執行緒互搶
+    同一個按鍵事件的問題。
+    """
     if keyboard_module is None:
         # print("警告: 某python套件不可用 請檢察")
         return
 
-    s_pressed_once = False
     while not shutdown_event.is_set():
         try:
             keyboard_module.wait("s")
@@ -1061,14 +1147,27 @@ def start_stop_listener(start_event: threading.Event, stop_event: threading.Even
         if shutdown_event.is_set():
             return
 
-        if not s_pressed_once:
-            start_event.set()
-            s_pressed_once = True
-            print("偵測到 's' → 開始播放。")
-        else:
-            stop_event.set()
-            print("偵測到第二次 's' → 停止播放並回到選歌。")
-            return
+        with session_lock:
+            start_event = session_ref.get("start_event")
+            stop_event = session_ref.get("stop_event")
+            started = session_ref.get("started", False)
+
+            if start_event is None:
+                # 目前不是「等待 's' 開始」的階段（例如還在選歌/下載/選難度），
+                # 忽略這次按鍵，避免誤觸發。
+                continue
+
+            if not started:
+                session_ref["started"] = True
+                start_event.set()
+                print("偵測到 's' → 開始播放。")
+            else:
+                if stop_event is not None:
+                    stop_event.set()
+                print("偵測到第二次 's' → 停止播放並回到選歌。")
+                session_ref["start_event"] = None
+                session_ref["stop_event"] = None
+                session_ref["started"] = False
 
 
 def esc_shutdown_listener(shutdown_event: threading.Event, current_stop_event_ref: Dict[str, Optional[threading.Event]]):
@@ -1152,10 +1251,10 @@ def play_events(
             else:
                 start_time_ns = now
 
-        print(
-            f"準備開始：現在 perf_counter_ns()={perf_ns()}, "
-            f"start_time_ns={start_time_ns}, 事件數={len(events)}"
-        )
+        # print(
+        #     f"準備開始：現在 perf_counter_ns()={perf_ns()}, "
+        #     f"start_time_ns={start_time_ns}, 事件數={len(events)}"
+        # )
 
         current_hand = start_with
         balloon_hits: Dict[int, int] = {}
@@ -1275,12 +1374,28 @@ def main():
     shutdown_event = threading.Event()
     current_stop_event_ref: Dict[str, Optional[threading.Event]] = {"event": None}
 
+    # 's' 開始/停止改成全程只用「一個」監聽執行緒 + 共用 session_ref，
+    # 避免每首歌重建監聽執行緒導致殘留執行緒互搶按鍵事件（見 s_key_listener 說明）。
+    session_lock = threading.Lock()
+    session_ref: Dict[str, Any] = {
+        "start_event": None,
+        "stop_event": None,
+        "started": False,
+    }
+
     esc_thread = threading.Thread(
         target=esc_shutdown_listener,
         args=(shutdown_event, current_stop_event_ref),
         daemon=True,
     )
     esc_thread.start()
+
+    s_listener_thread = threading.Thread(
+        target=s_key_listener,
+        args=(session_ref, session_lock, shutdown_event),
+        daemon=True,
+    )
+    s_listener_thread.start()
 
     hotkey_refs = []
     if keyboard_module is not None:
@@ -1290,12 +1405,12 @@ def main():
         except Exception as exc:
             print("註冊 z/x hotkey 失敗（可能權限問題）。熱鍵功能不可用。", exc)
 
-    print("流程：載入歌曲 → 中鍵選歌 → 確認 TJA → 記憶體解析 → 選難度 → S 開始。")
+    print("流程：載入歌曲 → 中鍵選歌 或 按 C 載入本機 TJA → 確認 TJA → 記憶體解析 → 選難度 → S 開始。")
     print("停止單首：第二次按 S；停止整個程式：0.3 秒內雙擊 Esc。")
 
     try:
         while not shutdown_event.is_set():
-            # 1. 等待中鍵，這個階段才允許選歌。
+            # 1. 等待中鍵或 C 鍵，這個階段才允許選歌。
             song = wait_for_song_selection(songs, shutdown_event)
             if shutdown_event.is_set():
                 break
@@ -1303,13 +1418,19 @@ def main():
                 time.sleep(0.05)
                 continue
 
-            # 2. 先確認 URL，再真正下載，避免 UI 無條件卡在下載流程。
-            tja_url = song["url"]
-            print(f"🔗 TJA：{tja_url}")
-            tja_data = download_tja_to_memory(tja_url)
-            if tja_data is None:
-                print("回到中鍵選歌。")
-                continue
+            # 2. 若是本機 TJA（按 C 選取），直接使用記憶體 bytes；
+            #    否則沿用原本流程：先確認 URL 再真正下載。
+            local_tja_bytes = song.get("_local_tja_bytes")
+            if local_tja_bytes is not None:
+                print(f"📄 使用本機 TJA 檔案：{song.get('title')}")
+                tja_data = local_tja_bytes
+            else:
+                tja_url = song["url"]
+                print(f"🔗 TJA：{tja_url}")
+                tja_data = download_tja_to_memory(tja_url)
+                if tja_data is None:
+                    print("回到中鍵選歌。")
+                    continue
 
             # 3. 下載完成後才讀取實際 TJA 難度，UI 只提供存在的難度。
             available_courses = detect_tja_courses(tja_data)
@@ -1364,16 +1485,16 @@ def main():
             #         print(f"  #{bi}: raw={val} -> expected_after_adjust={expected}")
 
             # 5. 選好難度後，才開啟本首的 S 開始/停止流程。
+            # 不再每首歌都建立新的監聽執行緒；改成更新共用的 session_ref，
+            # 讓全程只存在一個的 s_key_listener 執行緒去判斷這是開始還是停止。
             start_event = threading.Event()
             stop_event = threading.Event()
             current_stop_event_ref["event"] = stop_event
 
-            listener_thread = threading.Thread(
-                target=start_stop_listener,
-                args=(start_event, stop_event, shutdown_event),
-                daemon=True,
-            )
-            listener_thread.start()
+            with session_lock:
+                session_ref["start_event"] = start_event
+                session_ref["stop_event"] = stop_event
+                session_ref["started"] = False
 
             print("說明：按 's' 開始演奏，再按一次 's' 停止本首並回到選歌。")
             print("更多熱鍵：'z' = 每次快 7.5 ms，'x' = 每次慢 7.5 ms（會累加）。")
@@ -1390,16 +1511,21 @@ def main():
                 break
             if stop_event.is_set() and not start_event.is_set():
                 current_stop_event_ref["event"] = None
+                with session_lock:
+                    session_ref["start_event"] = None
+                    session_ref["stop_event"] = None
+                    session_ref["started"] = False
                 continue
 
             lead_ms = LEAD_MS
             if lead_ms is None:
                 lead_ms = 1500.0
 
-            print(
-                f"將在按下 's' 的時刻開始（LEAD_MS={lead_ms} ms 表示的語意已如說明）。"
-                f" DRY_RUN={DRY_RUN}"
-            )
+            # print(
+            #     f"將在按下 's' 的時刻開始（LEAD_MS={lead_ms} ms 表示的語意已如說明）。"
+            #     f" DRY_RUN={DRY_RUN}"
+            # )
+
             play_events(
                 augmented_events,
                 dry_run=DRY_RUN,
@@ -1411,6 +1537,10 @@ def main():
             )
 
             current_stop_event_ref["event"] = None
+            with session_lock:
+                session_ref["start_event"] = None
+                session_ref["stop_event"] = None
+                session_ref["started"] = False
 
             if shutdown_event.is_set():
                 break
